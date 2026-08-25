@@ -236,6 +236,174 @@ async function handleVerifyPayment(req: Request): Promise<Response> {
   }
 }
 
+// ============================================================
+// FLUTTERWAVE — backup payment provider (dormant until used)
+// ============================================================
+// This is a second, independent payment path in case DPO stays
+// unresponsive. It does NOT run unless you point the frontend at
+// these routes instead — nothing here affects your current DPO flow.
+//
+// TO ACTIVATE LATER:
+// 1. Create a Flutterwave account at flutterwave.com and get your
+//    Secret Key from Settings > API (starts with FLWSECK_).
+// 2. Add FLW_SECRET_KEY as an environment variable in Deno Deploy.
+// 3. In novalearn-ai.html, change the checkout calls from
+//    "/create-checkout" + "/verify-payment" to
+//    "/flw/create-checkout" + "/flw/verify-payment".
+// Flutterwave settles directly to your linked Namibian bank account —
+// same "no PayPal in the middle" behavior as DPO.
+
+const FLW_ENDPOINT = "https://api.flutterwave.com/v3/payments";
+const FLW_VERIFY_ENDPOINT = "https://api.flutterwave.com/v3/transactions"; // + /{id}/verify
+
+async function handleFlwCreateCheckout(req: Request): Promise<Response> {
+  const secretKey = Deno.env.get("FLW_SECRET_KEY");
+  const appUrl = Deno.env.get("APP_URL") || "https://example.com";
+
+  if (!secretKey) {
+    return json({
+      error: "Server is missing FLW_SECRET_KEY. Set it in Deno Deploy > Settings > Environment Variables once your Flutterwave account is ready.",
+    }, 500);
+  }
+
+  try {
+    const body = await req.json().catch(() => ({}));
+    const email = typeof body.email === "string" && body.email ? body.email : "student@example.com";
+    const txRef = `novalearn-${Date.now()}`;
+
+    const flwResponse = await fetch(FLW_ENDPOINT, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${secretKey}`,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        tx_ref: txRef,
+        amount: "5.99",
+        currency: "USD",
+        redirect_url: `${appUrl}/?payment=success`,
+        customer: { email },
+        customizations: { title: "NovaLearn AI Premium — monthly subscription" },
+      }),
+    });
+
+    const data = await flwResponse.json();
+    if (data.status !== "success" || !data.data?.link) {
+      console.error("Flutterwave create checkout failed:", data);
+      return json({ error: `Flutterwave could not start checkout: ${data.message || "unknown error"}` }, 502);
+    }
+
+    return json({ checkoutUrl: data.data.link, txRef });
+  } catch (err) {
+    console.error("flw create-checkout error:", err);
+    return json({ error: "Unexpected server error starting Flutterwave checkout." }, 500);
+  }
+}
+
+async function handleFlwVerifyPayment(req: Request): Promise<Response> {
+  const secretKey = Deno.env.get("FLW_SECRET_KEY");
+  if (!secretKey) {
+    return json({ error: "Server is missing FLW_SECRET_KEY." }, 500);
+  }
+
+  try {
+    const body = await req.json();
+    const transactionId = body.transactionId;
+    if (!transactionId) {
+      return json({ error: "Request must include 'transactionId' (from the redirect URL Flutterwave sends back)." }, 400);
+    }
+
+    const verifyResponse = await fetch(`${FLW_VERIFY_ENDPOINT}/${transactionId}/verify`, {
+      headers: { "Authorization": `Bearer ${secretKey}` },
+    });
+    const data = await verifyResponse.json();
+
+    // Flutterwave: status "successful" + currency/amount match = genuinely paid.
+    const active = data?.status === "success" && data?.data?.status === "successful";
+    return json({ active, status: data?.data?.status || null });
+  } catch (err) {
+    console.error("flw verify-payment error:", err);
+    return json({ error: "Unexpected server error verifying Flutterwave payment." }, 500);
+  }
+}
+
+// ============================================================
+// MANUAL BANK TRANSFER — works today, no third-party approval needed
+// ============================================================
+// While DPO/PayToday/etc. are stuck in review, this lets customers pay
+// by direct EFT into your own bank account, and lets YOU unlock their
+// Premium access yourself once you see the money land — no waiting on
+// anyone else's approval process.
+//
+// HOW IT WORKS:
+// 1. Each user gets a unique reference code shown in the app.
+// 2. They EFT the subscription amount into your bank account, using
+//    that code as the payment reference.
+// 3. You check your bank app/statement for a matching deposit.
+// 4. You (only you, since you hold the ADMIN_PASSWORD) generate an
+//    unlock code for that reference and send it to the customer
+//    (WhatsApp, SMS, however).
+// 5. They type the unlock code into the app, which asks this backend
+//    to verify it — and if it matches, Premium switches on for them.
+//
+// The actual secret (MANUAL_PAYMENT_SECRET) never leaves this server,
+// so nobody can generate a fake unlock code by reading the app's code.
+//
+// SET THESE IN DENO DEPLOY > SETTINGS > ENVIRONMENT VARIABLES:
+//   ADMIN_PASSWORD        = a password only you know (use a strong one)
+//   MANUAL_PAYMENT_SECRET = any long random string (never shared, never shown)
+
+async function hmacCode(referenceCode: string, secret: string): Promise<string> {
+  const enc = new TextEncoder();
+  const key = await crypto.subtle.importKey(
+    "raw", enc.encode(secret), { name: "HMAC", hash: "SHA-256" }, false, ["sign"]
+  );
+  const sig = await crypto.subtle.sign("HMAC", key, enc.encode(referenceCode.toUpperCase().trim()));
+  const hex = Array.from(new Uint8Array(sig)).map((b) => b.toString(16).padStart(2, "0")).join("");
+  return hex.slice(0, 8).toUpperCase();
+}
+
+async function handleManualGenerateCode(req: Request): Promise<Response> {
+  const adminPassword = Deno.env.get("ADMIN_PASSWORD");
+  const secret = Deno.env.get("MANUAL_PAYMENT_SECRET");
+  if (!adminPassword || !secret) {
+    return json({ error: "Server is missing ADMIN_PASSWORD or MANUAL_PAYMENT_SECRET. Set both in Deno Deploy > Settings > Environment Variables." }, 500);
+  }
+  try {
+    const body = await req.json();
+    if (body.adminPassword !== adminPassword) {
+      return json({ error: "Incorrect admin password." }, 401);
+    }
+    if (!body.referenceCode || typeof body.referenceCode !== "string") {
+      return json({ error: "Request must include 'referenceCode'." }, 400);
+    }
+    const unlockCode = await hmacCode(body.referenceCode, secret);
+    return json({ unlockCode });
+  } catch (err) {
+    console.error("manual generate-code error:", err);
+    return json({ error: "Unexpected server error generating code." }, 500);
+  }
+}
+
+async function handleManualVerifyCode(req: Request): Promise<Response> {
+  const secret = Deno.env.get("MANUAL_PAYMENT_SECRET");
+  if (!secret) {
+    return json({ error: "Server is missing MANUAL_PAYMENT_SECRET." }, 500);
+  }
+  try {
+    const body = await req.json();
+    if (!body.referenceCode || !body.unlockCode) {
+      return json({ error: "Request must include 'referenceCode' and 'unlockCode'." }, 400);
+    }
+    const expected = await hmacCode(body.referenceCode, secret);
+    const valid = expected === String(body.unlockCode).toUpperCase().trim();
+    return json({ valid });
+  } catch (err) {
+    console.error("manual verify-code error:", err);
+    return json({ error: "Unexpected server error verifying code." }, 500);
+  }
+}
+
 // ---- Router ----
 Deno.serve(async (req: Request) => {
   if (req.method === "OPTIONS") {
@@ -253,7 +421,16 @@ Deno.serve(async (req: Request) => {
       return handleCreateCheckout(req);
     case "/verify-payment":
       return handleVerifyPayment(req);
+    case "/flw/create-checkout":
+      return handleFlwCreateCheckout(req);
+    case "/flw/verify-payment":
+      return handleFlwVerifyPayment(req);
+    case "/manual/generate-code":
+      return handleManualGenerateCode(req);
+    case "/manual/verify-code":
+      return handleManualVerifyCode(req);
     default:
-      return json({ error: `Unknown route ${pathname}. Use /chat, /create-checkout, or /verify-payment.` }, 404);
+      return json({ error: `Unknown route ${pathname}.` }, 404);
   }
 });
+
