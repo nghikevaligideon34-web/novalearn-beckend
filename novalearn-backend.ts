@@ -32,7 +32,7 @@
 
 // ---- Shared config ----
 const GROQ_ENDPOINT = "https://api.groq.com/openai/v1/chat/completions";
-const DEFAULT_MODEL = "llama-3.3-70b-versatile";
+const DEFAULT_MODEL = "openai/gpt-oss-120b"; // llama-3.3-70b-versatile was deprecated by Groq on 2026-06-17
 
 const DPO_LIVE_ENDPOINT = "https://secure.3gdirectpay.com/API/v6/";
 const DPO_TEST_ENDPOINT = "https://secure1.sandbox.directpay.online/API/v6/"; // confirm with DPO onboarding docs
@@ -433,4 +433,3 @@ Deno.serve(async (req: Request) => {
       return json({ error: `Unknown route ${pathname}.` }, 404);
   }
 });
-
